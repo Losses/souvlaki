@@ -18,6 +18,7 @@ use cocoa::{
 use core_graphics::geometry::CGSize;
 
 use dispatch::{Queue, QueuePriority};
+use objc::rc::{autoreleasepool, StrongPtr};
 use objc::{class, msg_send, sel, sel_impl};
 
 use crate::{MediaControlEvent, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig};
@@ -52,13 +53,15 @@ impl MediaControls {
 
     /// Set the current playback status.
     pub fn set_playback(&mut self, playback: MediaPlayback) -> Result<(), Error> {
-        unsafe { set_playback_status(playback) };
+        // The caller's thread may have no autorelease pool of its own.
+        autoreleasepool(|| unsafe { set_playback_status(playback) });
         Ok(())
     }
 
     /// Set the metadata of the currently playing media item.
     pub fn set_metadata(&mut self, metadata: MediaMetadata) -> Result<(), Error> {
-        unsafe { set_playback_metadata(metadata) };
+        // The caller's thread may have no autorelease pool of its own.
+        autoreleasepool(|| unsafe { set_playback_metadata(metadata) });
         Ok(())
     }
 }
@@ -106,15 +109,15 @@ unsafe fn set_playback_metadata(metadata: MediaMetadata) {
     let media_center: id = msg_send!(class!(MPNowPlayingInfoCenter), defaultCenter);
     let now_playing: id = msg_send!(class!(NSMutableDictionary), dictionary);
     if let Some(title) = metadata.title {
-        let _: () = msg_send!(now_playing, setObject: ns_string(title)
+        let _: () = msg_send!(now_playing, setObject: *ns_string(title)
                                               forKey: MPMediaItemPropertyTitle);
     }
     if let Some(artist) = metadata.artist {
-        let _: () = msg_send!(now_playing, setObject: ns_string(artist)
+        let _: () = msg_send!(now_playing, setObject: *ns_string(artist)
                                               forKey: MPMediaItemPropertyArtist);
     }
     if let Some(album) = metadata.album {
-        let _: () = msg_send!(now_playing, setObject: ns_string(album)
+        let _: () = msg_send!(now_playing, setObject: *ns_string(album)
                                               forKey: MPMediaItemPropertyAlbumTitle);
     }
     if let Some(duration) = metadata.duration {
@@ -124,17 +127,21 @@ unsafe fn set_playback_metadata(metadata: MediaMetadata) {
     if let Some(cover_url) = metadata.cover_url {
         let cover_url = cover_url.to_owned();
         Queue::global(QueuePriority::Default).exec_async(move || {
-            load_and_set_playback_artwork(cover_url, prev_counter + 1);
+            autoreleasepool(|| load_and_set_playback_artwork(cover_url, prev_counter + 1));
         });
     }
     let _: () = msg_send!(media_center, setNowPlayingInfo: now_playing);
 }
 
 unsafe fn load_and_set_playback_artwork(url: String, for_counter: usize) {
-    let (image, size) = load_image_from_url(&url);
+    let Some((image, size)) = load_image_from_url(&url) else {
+        return;
+    };
+    // The artwork keeps the image; the dictionary it is put in keeps the artwork. Artwork made
+    // for metadata that is no longer shown is released here with its image.
     let artwork = mp_artwork(image, size);
     if GLOBAL_METADATA_COUNTER.load(Ordering::SeqCst) == for_counter {
-        set_playback_artwork(artwork);
+        set_playback_artwork(*artwork);
     }
 }
 
@@ -276,8 +283,9 @@ unsafe fn detach_command_handlers() {
     let _: () = msg_send!(cmd, removeTarget: nil);
 }
 
-unsafe fn ns_string(value: &str) -> id {
-    NSString::alloc(nil).init_str(value)
+/// A new string, which is released when the value is dropped.
+unsafe fn ns_string(value: &str) -> StrongPtr {
+    StrongPtr::new(NSString::alloc(nil).init_str(value))
 }
 
 unsafe fn ns_number(value: f64) -> id {
@@ -285,52 +293,67 @@ unsafe fn ns_number(value: f64) -> id {
     number
 }
 
+#[cfg(target_os = "macos")]
 unsafe fn ns_url(value: &str) -> id {
-    let url: id = msg_send!(class!(NSURL), URLWithString: ns_string(value));
+    let url: id = msg_send!(class!(NSURL), URLWithString: *ns_string(value));
     url
 }
 
+/// The image at `url` and its size, or `None` if there is none to load. The image is released
+/// when the value is dropped.
 #[cfg(target_os = "ios")]
-unsafe fn load_image_from_url(url: &str) -> (id, CGSize) {
+unsafe fn load_image_from_url(url: &str) -> Option<(StrongPtr, CGSize)> {
     let image_data = fs::read(&url).unwrap();
     let base64_data = base64::encode(image_data);
     let base64_ns_string = ns_string(&base64_data);
 
     let ns_data: id = msg_send!(class!(NSData), alloc);
-    let ns_data: id = msg_send!(ns_data, initWithBase64EncodedString: base64_ns_string
+    let ns_data: id = msg_send!(ns_data, initWithBase64EncodedString: *base64_ns_string
                                           options: 0);
     if ns_data == nil {
-        return (nil, CGSize::new(0.0, 0.0));
+        return None;
     }
-    let image: id = msg_send!(class!(UIImage), imageWithData: ns_data);
+    let ns_data = StrongPtr::new(ns_data);
+    let image: id = msg_send!(class!(UIImage), imageWithData: *ns_data);
     if image == nil {
-        return (nil, CGSize::new(0.0, 0.0));
+        return None;
     }
     let size: CGSize = msg_send!(image, size);
-    (image, size)
+    // `imageWithData:` returns an image this code does not own.
+    Some((StrongPtr::retain(image), size))
 }
 
+/// The image at `url` and its size, or `None` if there is none to load. The image is released
+/// when the value is dropped.
 #[cfg(target_os = "macos")]
-unsafe fn load_image_from_url(url: &str) -> (id, CGSize) {
+unsafe fn load_image_from_url(url: &str) -> Option<(StrongPtr, CGSize)> {
     let url = ns_url(url);
     let image: id = msg_send!(class!(NSImage), alloc);
     let image: id = msg_send!(image, initWithContentsOfURL: url);
-    let size: CGSize = msg_send!(image, size);
-    (image, CGSize::new(size.width, size.height))
+    if image == nil {
+        return None;
+    }
+    let image = StrongPtr::new(image);
+    let size: CGSize = msg_send!(*image, size);
+    Some((image, CGSize::new(size.width, size.height)))
 }
 
+/// An artwork of `image`, which the artwork keeps. The artwork is released when the value is
+/// dropped.
 #[cfg(target_os = "ios")]
-unsafe fn mp_artwork(image: id, bounds: CGSize) -> id {
+unsafe fn mp_artwork(image: StrongPtr, _bounds: CGSize) -> StrongPtr {
     let artwork: id = msg_send!(class!(MPMediaItemArtwork), alloc);
-    let artwork: id = msg_send!(artwork, initWithImage: image);
-    artwork
+    let artwork: id = msg_send!(artwork, initWithImage: *image);
+    StrongPtr::new(artwork)
 }
 
+/// An artwork of `image`. Its request handler owns the image, so the image lives as long as the
+/// artwork may ask for it. The artwork is released when the value is dropped.
 #[cfg(target_os = "macos")]
-unsafe fn mp_artwork(image: id, bounds: CGSize) -> id {
-    let handler = ConcreteBlock::new(move |_size: CGSize| -> id { image }).copy();
+unsafe fn mp_artwork(image: StrongPtr, bounds: CGSize) -> StrongPtr {
+    let handler = ConcreteBlock::new(move |_size: CGSize| -> id { *image }).copy();
     let artwork: id = msg_send!(class!(MPMediaItemArtwork), alloc);
     let artwork: id = msg_send!(artwork, initWithBoundsSize: bounds
-                                         requestHandler: handler);
-    artwork
+                                         requestHandler: &*handler);
+    StrongPtr::new(artwork)
 }
