@@ -6,7 +6,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use zbus::{dbus_interface, ConnectionBuilder, SignalContext};
+use zbus::{dbus_interface, Connection, ConnectionBuilder, SignalContext};
 use zvariant::{ObjectPath, Value};
 
 use crate::{
@@ -14,6 +14,9 @@ use crate::{
 };
 
 use super::Error;
+
+/// The object path every MPRIS player serves its interfaces at.
+const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
 
 /// A handle to OS media controls.
 pub struct MediaControls {
@@ -24,7 +27,7 @@ pub struct MediaControls {
 
 struct ServiceThreadHandle {
     event_channel: mpsc::Sender<InternalEvent>,
-    thread: JoinHandle<()>,
+    thread: JoinHandle<Result<(), Error>>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -86,16 +89,22 @@ impl MediaControls {
     {
         self.detach()?;
 
-        let dbus_name = self.dbus_name.clone();
-        let friendly_name = self.friendly_name.clone();
         let event_handler = Arc::new(Mutex::new(event_handler));
         let (event_channel, rx) = mpsc::channel();
+
+        // Check if the connection can be created BEFORE spawning the new thread, so that a
+        // session bus that cannot be reached, or a name that cannot be taken, is this call's
+        // error.
+        let connection = pollster::block_on(connect(
+            &self.dbus_name,
+            self.friendly_name.clone(),
+            event_handler,
+        ))?;
 
         self.thread = Some(ServiceThreadHandle {
             event_channel,
             thread: thread::spawn(move || {
-                pollster::block_on(run_service(dbus_name, friendly_name, event_handler, rx))
-                    .unwrap();
+                pollster::block_on(run_service(connection, rx)).map_err(Error::from)
             }),
         });
         Ok(())
@@ -107,8 +116,12 @@ impl MediaControls {
             thread,
         }) = self.thread.take()
         {
+            // We don't care about the result of this event, since we immediately
+            // check how the thread ended on the next line.
             event_channel.send(InternalEvent::Kill).ok();
-            thread.join().map_err(|_| Error::ThreadPanicked)?;
+            // One error in case the thread panics, and the other one in case the
+            // thread has returned an error.
+            thread.join().map_err(|_| Error::ThreadPanicked)??;
         }
         Ok(())
     }
@@ -132,8 +145,14 @@ impl MediaControls {
     }
 
     fn send_internal_event(&mut self, event: InternalEvent) -> Result<(), Error> {
-        let channel = &self.thread.as_ref().ok_or(Error::ThreadNotRunning)?.event_channel;
-        channel.send(event).map_err(|_| Error::ThreadPanicked)
+        let thread = self.thread.as_ref().ok_or(Error::ThreadNotRunning)?;
+        if thread.event_channel.send(event).is_ok() {
+            return Ok(());
+        }
+        // Nobody receives: the service thread ended on its own, as it does when the session bus
+        // goes away. Its error is reported once; from then on the thread is not running.
+        self.detach()?;
+        Err(Error::ThreadNotRunning)
     }
 }
 
@@ -376,12 +395,12 @@ impl PlayerInterface {
     }
 }
 
-async fn run_service(
-    dbus_name: String,
+/// Connect to the session bus and serve the MPRIS interfaces there under the player's name.
+async fn connect(
+    dbus_name: &str,
     friendly_name: String,
     event_handler: Arc<Mutex<dyn Fn(MediaControlEvent) + Send + 'static>>,
-    event_channel: mpsc::Receiver<InternalEvent>,
-) -> zbus::Result<()> {
+) -> zbus::Result<Connection> {
     let app = AppInterface {
         friendly_name,
         event_handler: event_handler.clone(),
@@ -397,13 +416,19 @@ async fn run_service(
     };
 
     let name = format!("org.mpris.MediaPlayer2.{dbus_name}");
-    let path = ObjectPath::try_from("/org/mpris/MediaPlayer2")?;
-    let connection = ConnectionBuilder::session()?
-        .serve_at(&path, app)?
-        .serve_at(&path, player)?
+    ConnectionBuilder::session()?
+        .serve_at(MPRIS_PATH, app)?
+        .serve_at(MPRIS_PATH, player)?
         .name(name.as_str())?
         .build()
-        .await?;
+        .await
+}
+
+async fn run_service(
+    connection: Connection,
+    event_channel: mpsc::Receiver<InternalEvent>,
+) -> zbus::Result<()> {
+    let path = ObjectPath::try_from(MPRIS_PATH)?;
 
     loop {
         if let Ok(event) = event_channel.recv_timeout(Duration::from_millis(10)) {
